@@ -1,94 +1,68 @@
 from flask import Flask, request, jsonify
 import requests
-import yt_dlp
 import random
 
 app = Flask(__name__)
 
-INVIDIOUS_INSTANCES = [
-    "https://invidious.nerdvpn.de",
-    "https://invidious.privacyredirect.com",
-    "https://inv.nadeko.net",
-    "https://invidious.io.lol",
-    "https://iv.melmac.space",
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.tokhmi.xyz",
+    "https://piped-api.garudalinux.org",
+    "https://api.piped.projectsegfau.lt",
 ]
 
-def search_invidious(query):
-    random.shuffle(INVIDIOUS_INSTANCES)
-    for instance in INVIDIOUS_INSTANCES:
+def search_piped(query):
+    random.shuffle(PIPED_INSTANCES)
+    for instance in PIPED_INSTANCES:
         try:
-            resp = requests.get(f"{instance}/api/v1/search",
-                params={"q": query, "type": "video", "sort_by": "relevance"},
-                timeout=10)
-            if resp.status_code != 200:
+            # Search for the song
+            search_resp = requests.get(
+                f"{instance}/search",
+                params={"q": query, "filter": "music_songs"},
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            if search_resp.status_code != 200:
                 continue
-            results = resp.json()
-            if not results:
+
+            items = search_resp.json().get("items", [])
+            if not items:
                 continue
-            video_id = results[0].get("videoId")
+
+            video_id = items[0].get("url", "").replace("/watch?v=", "")
             if not video_id:
                 continue
-            video_resp = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=10)
-            if video_resp.status_code != 200:
+
+            # Get streams for the video
+            streams_resp = requests.get(
+                f"{instance}/streams/{video_id}",
+                timeout=15,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            if streams_resp.status_code != 200:
                 continue
-            video_data = video_resp.json()
-            audio_formats = [
-                f for f in video_data.get("adaptiveFormats", [])
-                if f.get("type", "").startswith("audio/")
-            ]
-            if not audio_formats:
+
+            data = streams_resp.json()
+            audio_streams = data.get("audioStreams", [])
+            if not audio_streams:
                 continue
-            audio_formats.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
-            best = audio_formats[0]
+
+            # Pick highest quality audio
+            best = max(audio_streams, key=lambda x: x.get("bitrate", 0))
+
             return {
                 "url": best["url"],
-                "title": video_data.get("title", query),
-                "duration": video_data.get("lengthSeconds", 0),
-                "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                "title": data.get("title", query),
+                "duration": data.get("duration", 0),
+                "thumbnail": data.get("thumbnailUrl", ""),
                 "ext": "webm",
                 "abr": best.get("bitrate", 0) // 1000,
-                "source": "invidious"
+                "source": "piped"
             }
         except Exception as e:
-            print(f"Invidious {instance} failed: {e}")
+            print(f"Piped {instance} failed: {e}")
             continue
-    return None
-
-def search_ytdlp_fallback(query):
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "default_search": "ytsearch1",
-        "socket_timeout": 30,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
-        },
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-        if info and "entries" in info and info["entries"]:
-            entry = info["entries"][0]
-            formats = entry.get("formats", [])
-            audio_formats = [
-                f for f in formats
-                if f.get("acodec") != "none"
-                and f.get("vcodec") == "none"
-                and f.get("url")
-            ]
-            if not audio_formats:
-                audio_formats = [f for f in formats if f.get("acodec") != "none" and f.get("url")]
-            if audio_formats:
-                best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
-                return {
-                    "url": best["url"],
-                    "title": entry.get("title", ""),
-                    "duration": entry.get("duration", 0),
-                    "thumbnail": entry.get("thumbnail", ""),
-                    "ext": best.get("ext", "webm"),
-                    "abr": best.get("abr", 0),
-                    "source": "ytdlp"
-                }
     return None
 
 @app.route("/stream")
@@ -97,9 +71,7 @@ def stream():
     if not query:
         return jsonify({"success": False, "error": "No query provided"}), 400
     try:
-        result = search_invidious(query)
-        if not result:
-            result = search_ytdlp_fallback(query)
+        result = search_piped(query)
         if result:
             return jsonify({"success": True, "data": result})
         return jsonify({"success": False, "error": "No results found"}), 404
@@ -114,9 +86,9 @@ def health():
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "endpoints": {
-            "/stream?q=song+name": "Get audio stream URL",
+            "/stream?q=song+name": "Get audio stream URL via Piped",
             "/health": "Health check"
         }
     })
