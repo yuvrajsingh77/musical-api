@@ -5,18 +5,24 @@ import threading
 app = Flask(__name__)
 
 SAAVN_API = "https://jiosaavn-api.vercel.app"
+RAILWAY_URL = "https://web-production-7318d.up.railway.app"
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36",
     "Accept": "application/json",
     "Referer": "https://www.jiosaavn.com/"
 }
 
-# Cache: song_id -> stream_url (valid for ~5 min)
+CDN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36",
+    "Referer": "https://www.jiosaavn.com/",
+    "Origin": "https://www.jiosaavn.com"
+}
+
 stream_cache = {}
 cache_lock = threading.Lock()
 
 def get_fresh_stream_url(song_id):
-    """Always fetch a fresh stream URL from JioSaavn"""
     resp = requests.get(
         f"{SAAVN_API}/song",
         params={"id": song_id},
@@ -66,12 +72,10 @@ def song():
 
 @app.route("/stream")
 def stream():
-    """One-shot: search + return proxied stream URL"""
     query = request.args.get("q", "").strip()
     if not query:
         return jsonify({"success": False, "error": "No query"}), 400
     try:
-        # Search
         search_resp = requests.get(
             f"{SAAVN_API}/search",
             params={"query": query},
@@ -98,10 +102,6 @@ def stream():
         except:
             duration_secs = 0
 
-        # Return proxied audio URL instead of direct CDN URL
-        proxy_url = request.host_url + f"audio/{song_id}"
-
-        # Cache the fresh CDN URL server-side
         cdn_url = (
             song_data.get("media_urls", {}).get("320_KBPS") or
             song_data.get("media_urls", {}).get("160_KBPS") or
@@ -109,6 +109,8 @@ def stream():
         )
         with cache_lock:
             stream_cache[song_id] = cdn_url
+
+        proxy_url = f"{RAILWAY_URL}/audio/{song_id}"
 
         return jsonify({
             "success": True,
@@ -119,7 +121,7 @@ def stream():
                 "album": song_data.get("album", ""),
                 "artwork": song_data.get("image", ""),
                 "duration": duration_secs,
-                "url": proxy_url,  # Points to Railway, not JioSaavn CDN
+                "url": proxy_url,
                 "ext": "mp4"
             }
         })
@@ -128,50 +130,42 @@ def stream():
 
 @app.route("/audio/<song_id>")
 def audio(song_id):
-    """Proxy audio stream - fetches fresh URL and streams to client"""
     try:
-        # Get cached URL or fetch fresh one
-        with cache_lock:
-            cdn_url = stream_cache.get(song_id)
-
-        if not cdn_url:
-            cdn_url = get_fresh_stream_url(song_id)
-
+        # Always fetch fresh URL since CDN URLs expire
+        cdn_url = get_fresh_stream_url(song_id)
         if not cdn_url:
             return jsonify({"error": "No stream URL"}), 404
 
-        # Stream the audio from JioSaavn CDN to the client
-        cdn_headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.jiosaavn.com/",
-            "Range": request.headers.get("Range", "bytes=0-")
-        }
+        range_header = request.headers.get("Range", None)
+        req_headers = dict(CDN_HEADERS)
+        if range_header:
+            req_headers["Range"] = range_header
 
         cdn_resp = requests.get(
             cdn_url,
-            headers=cdn_headers,
+            headers=req_headers,
             stream=True,
-            timeout=30
+            timeout=60
         )
 
+        excluded = {"transfer-encoding", "connection", "keep-alive"}
+        response_headers = {
+            k: v for k, v in cdn_resp.headers.items()
+            if k.lower() not in excluded
+        }
+        response_headers["Accept-Ranges"] = "bytes"
+        response_headers["Access-Control-Allow-Origin"] = "*"
+
         def generate():
-            for chunk in cdn_resp.iter_content(chunk_size=8192):
+            for chunk in cdn_resp.iter_content(chunk_size=32768):
                 if chunk:
                     yield chunk
-
-        response_headers = {
-            "Content-Type": cdn_resp.headers.get("Content-Type", "audio/mp4"),
-            "Accept-Ranges": "bytes",
-        }
-        if "Content-Length" in cdn_resp.headers:
-            response_headers["Content-Length"] = cdn_resp.headers["Content-Length"]
-        if "Content-Range" in cdn_resp.headers:
-            response_headers["Content-Range"] = cdn_resp.headers["Content-Range"]
 
         return Response(
             generate(),
             status=cdn_resp.status_code,
-            headers=response_headers
+            headers=response_headers,
+            direct_passthrough=True
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -184,13 +178,7 @@ def health():
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "5.0.0",
-        "endpoints": {
-            "/search?q=query": "Search songs",
-            "/stream?q=query": "Get proxied stream",
-            "/audio/<id>": "Proxy audio stream",
-            "/health": "Health check"
-        }
+        "version": "6.0.0"
     })
 
 if __name__ == "__main__":
