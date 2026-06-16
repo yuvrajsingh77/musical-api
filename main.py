@@ -1,80 +1,112 @@
 from flask import Flask, request, jsonify
 import requests
-import random
 
 app = Flask(__name__)
 
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://pipedapi.tokhmi.xyz",
-    "https://piped-api.garudalinux.org",
-    "https://api.piped.projectsegfau.lt",
-]
+SAAVN_API = "https://jiosaavn-api.vercel.app"
 
-def search_piped(query):
-    random.shuffle(PIPED_INSTANCES)
-    for instance in PIPED_INSTANCES:
-        try:
-            # Search for the song
-            search_resp = requests.get(
-                f"{instance}/search",
-                params={"q": query, "filter": "music_songs"},
-                timeout=10,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            if search_resp.status_code != 200:
-                continue
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Referer": "https://www.jiosaavn.com/"
+}
 
-            items = search_resp.json().get("items", [])
-            if not items:
-                continue
+@app.route("/search")
+def search():
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"success": False, "error": "No query"}), 400
+    try:
+        resp = requests.get(
+            f"{SAAVN_API}/search",
+            params={"query": query},
+            headers=HEADERS,
+            timeout=15
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-            video_id = items[0].get("url", "").replace("/watch?v=", "")
-            if not video_id:
-                continue
-
-            # Get streams for the video
-            streams_resp = requests.get(
-                f"{instance}/streams/{video_id}",
-                timeout=15,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            if streams_resp.status_code != 200:
-                continue
-
-            data = streams_resp.json()
-            audio_streams = data.get("audioStreams", [])
-            if not audio_streams:
-                continue
-
-            # Pick highest quality audio
-            best = max(audio_streams, key=lambda x: x.get("bitrate", 0))
-
-            return {
-                "url": best["url"],
-                "title": data.get("title", query),
-                "duration": data.get("duration", 0),
-                "thumbnail": data.get("thumbnailUrl", ""),
-                "ext": "webm",
-                "abr": best.get("bitrate", 0) // 1000,
-                "source": "piped"
-            }
-        except Exception as e:
-            print(f"Piped {instance} failed: {e}")
-            continue
-    return None
+@app.route("/song")
+def song():
+    song_id = request.args.get("id", "").strip()
+    if not song_id:
+        return jsonify({"success": False, "error": "No song id"}), 400
+    try:
+        resp = requests.get(
+            f"{SAAVN_API}/song",
+            params={"id": song_id},
+            headers=HEADERS,
+            timeout=20
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/stream")
 def stream():
+    """One-shot endpoint: search + get stream URL in one call"""
     query = request.args.get("q", "").strip()
     if not query:
-        return jsonify({"success": False, "error": "No query provided"}), 400
+        return jsonify({"success": False, "error": "No query"}), 400
     try:
-        result = search_piped(query)
-        if result:
-            return jsonify({"success": True, "data": result})
-        return jsonify({"success": False, "error": "No results found"}), 404
+        # Step 1: Search
+        search_resp = requests.get(
+            f"{SAAVN_API}/search",
+            params={"query": query},
+            headers=HEADERS,
+            timeout=15
+        )
+        search_data = search_resp.json()
+        results = search_data.get("results", [])
+        if not results:
+            return jsonify({"success": False, "error": "No search results"}), 404
+
+        # Step 2: Get first result's full song data
+        song_id = results[0].get("id")
+        if not song_id:
+            return jsonify({"success": False, "error": "No song ID"}), 404
+
+        song_resp = requests.get(
+            f"{SAAVN_API}/song",
+            params={"id": song_id},
+            headers=HEADERS,
+            timeout=20
+        )
+        song_data = song_resp.json()
+
+        # Step 3: Extract best stream URL
+        media_urls = song_data.get("media_urls", {})
+        stream_url = (
+            media_urls.get("320_KBPS") or
+            media_urls.get("160_KBPS") or
+            media_urls.get("96_KBPS") or
+            song_data.get("media_url")
+        )
+
+        if not stream_url:
+            return jsonify({"success": False, "error": "No stream URL found"}), 404
+
+        duration_str = song_data.get("duration", "0:00")
+        try:
+            parts = duration_str.split(":")
+            duration_secs = int(parts[0]) * 60 + int(parts[1])
+        except:
+            duration_secs = 0
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "id": song_data.get("id", song_id),
+                "title": song_data.get("song", query),
+                "artist": song_data.get("singers", "Unknown"),
+                "album": song_data.get("album", ""),
+                "artwork": song_data.get("image", ""),
+                "duration": duration_secs,
+                "url": stream_url,
+                "ext": "mp4"
+            }
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -86,9 +118,11 @@ def health():
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "endpoints": {
-            "/stream?q=song+name": "Get audio stream URL via Piped",
+            "/search?q=query": "Search songs",
+            "/song?id=songId": "Get song details + stream URL",
+            "/stream?q=query": "One-shot: search + stream URL",
             "/health": "Health check"
         }
     })
