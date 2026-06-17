@@ -131,42 +131,15 @@ def stream():
 @app.route("/audio/<song_id>")
 def audio(song_id):
     try:
-        # Always fetch fresh URL since CDN URLs expire
+        # Fetch a fresh CDN URL every time (CDN URLs expire quickly)
         cdn_url = get_fresh_stream_url(song_id)
         if not cdn_url:
             return jsonify({"error": "No stream URL"}), 404
 
-        range_header = request.headers.get("Range", None)
-        req_headers = dict(CDN_HEADERS)
-        if range_header:
-            req_headers["Range"] = range_header
-
-        cdn_resp = requests.get(
-            cdn_url,
-            headers=req_headers,
-            stream=True,
-            timeout=60
-        )
-
-        excluded = {"transfer-encoding", "connection", "keep-alive"}
-        response_headers = {
-            k: v for k, v in cdn_resp.headers.items()
-            if k.lower() not in excluded
-        }
-        response_headers["Accept-Ranges"] = "bytes"
-        response_headers["Access-Control-Allow-Origin"] = "*"
-
-        def generate():
-            for chunk in cdn_resp.iter_content(chunk_size=32768):
-                if chunk:
-                    yield chunk
-
-        return Response(
-            generate(),
-            status=cdn_resp.status_code,
-            headers=response_headers,
-            direct_passthrough=True
-        )
+        # Redirect to CDN directly — ExoPlayer follows redirects automatically
+        # This avoids memory issues from proxying large audio files
+        from flask import redirect
+        return redirect(cdn_url, code=302)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
