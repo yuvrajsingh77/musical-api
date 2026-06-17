@@ -1,42 +1,92 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, redirect
 import requests
-import threading
 
 app = Flask(__name__)
 
-SAAVN_API = "https://jiosaavn-api.vercel.app"
-RAILWAY_URL = "https://web-production-7318d.up.railway.app"
+CLIENT_ID = "9RxIC6NwiaJEj6SsGAJgmHYOYauqhn9E"
+SC_BASE = "https://api-v2.soundcloud.com"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36",
-    "Accept": "application/json",
-    "Referer": "https://www.jiosaavn.com/"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Origin": "https://soundcloud.com",
+    "Referer": "https://soundcloud.com/"
 }
 
-CDN_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36",
-    "Referer": "https://www.jiosaavn.com/",
-    "Origin": "https://www.jiosaavn.com"
-}
-
-stream_cache = {}
-cache_lock = threading.Lock()
-
-def get_fresh_stream_url(song_id):
+def get_stream_url(transcoding_url):
+    """Resolve transcoding URL to actual stream URL"""
     resp = requests.get(
-        f"{SAAVN_API}/song",
-        params={"id": song_id},
+        transcoding_url,
+        params={"client_id": CLIENT_ID},
         headers=HEADERS,
-        timeout=20
+        timeout=10
     )
-    data = resp.json()
-    media_urls = data.get("media_urls", {})
-    return (
-        media_urls.get("320_KBPS") or
-        media_urls.get("160_KBPS") or
-        media_urls.get("96_KBPS") or
-        data.get("media_url")
+    if resp.status_code == 200:
+        return resp.json().get("url")
+    return None
+
+def search_track(query):
+    """Search SoundCloud and return best matching track with stream URL"""
+    resp = requests.get(
+        f"{SC_BASE}/search/tracks",
+        params={
+            "q": query,
+            "client_id": CLIENT_ID,
+            "limit": 5,
+            "offset": 0
+        },
+        headers=HEADERS,
+        timeout=15
     )
+    if resp.status_code != 200:
+        print(f"Search failed: {resp.status_code} {resp.text[:200]}")
+        return None
+
+    tracks = resp.json().get("collection", [])
+    if not tracks:
+        return None
+
+    # Find first streamable track
+    for track in tracks:
+        if not track.get("streamable"):
+            continue
+        if track.get("policy") == "BLOCK":
+            continue
+
+        transcodings = track.get("media", {}).get("transcodings", [])
+
+        # Prefer progressive MP3 stream
+        stream_url = None
+        for t in transcodings:
+            fmt = t.get("format", {})
+            if fmt.get("protocol") == "progressive" and "mpeg" in fmt.get("mime_type", ""):
+                stream_url = get_stream_url(t["url"])
+                break
+
+        # Fallback to HLS
+        if not stream_url:
+            for t in transcodings:
+                stream_url = get_stream_url(t["url"])
+                if stream_url:
+                    break
+
+        if not stream_url:
+            continue
+
+        artwork = track.get("artwork_url", "") or ""
+        artwork = artwork.replace("large", "t500x500")  # Get high res
+
+        return {
+            "id": str(track.get("id", "")),
+            "title": track.get("title", "Unknown"),
+            "artist": track.get("user", {}).get("username", "Unknown"),
+            "album": "",
+            "artwork": artwork,
+            "duration": (track.get("duration", 0) or 0) // 1000,
+            "url": stream_url,
+            "ext": "mp3"
+        }
+    return None
 
 @app.route("/search")
 def search():
@@ -45,28 +95,29 @@ def search():
         return jsonify({"success": False, "error": "No query"}), 400
     try:
         resp = requests.get(
-            f"{SAAVN_API}/search",
-            params={"query": query},
+            f"{SC_BASE}/search/tracks",
+            params={"q": query, "client_id": CLIENT_ID, "limit": 20},
             headers=HEADERS,
             timeout=15
         )
-        return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        if resp.status_code != 200:
+            return jsonify({"success": False, "error": f"SC error {resp.status_code}"}), 500
 
-@app.route("/song")
-def song():
-    song_id = request.args.get("id", "").strip()
-    if not song_id:
-        return jsonify({"success": False, "error": "No song id"}), 400
-    try:
-        resp = requests.get(
-            f"{SAAVN_API}/song",
-            params={"id": song_id},
-            headers=HEADERS,
-            timeout=20
-        )
-        return jsonify(resp.json()), resp.status_code
+        tracks = resp.json().get("collection", [])
+        results = []
+        for t in tracks:
+            if not t.get("streamable") or t.get("policy") == "BLOCK":
+                continue
+            artwork = (t.get("artwork_url") or "").replace("large", "t500x500")
+            results.append({
+                "id": str(t.get("id", "")),
+                "title": t.get("title", "Unknown"),
+                "artist": t.get("user", {}).get("username", "Unknown"),
+                "artwork": artwork,
+                "duration": (t.get("duration", 0) or 0) // 1000,
+            })
+
+        return jsonify({"success": True, "results": results})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -76,82 +127,28 @@ def stream():
     if not query:
         return jsonify({"success": False, "error": "No query"}), 400
     try:
-        search_resp = requests.get(
-            f"{SAAVN_API}/search",
-            params={"query": query},
-            headers=HEADERS,
-            timeout=15
-        )
-        results = search_resp.json().get("results", [])
-        if not results:
-            return jsonify({"success": False, "error": "No results"}), 404
-
-        song_id = results[0].get("id")
-        song_data_resp = requests.get(
-            f"{SAAVN_API}/song",
-            params={"id": song_id},
-            headers=HEADERS,
-            timeout=20
-        )
-        song_data = song_data_resp.json()
-
-        duration_str = song_data.get("duration", "0:00")
-        try:
-            parts = duration_str.split(":")
-            duration_secs = int(parts[0]) * 60 + int(parts[1])
-        except:
-            duration_secs = 0
-
-        cdn_url = (
-            song_data.get("media_urls", {}).get("320_KBPS") or
-            song_data.get("media_urls", {}).get("160_KBPS") or
-            song_data.get("media_url")
-        )
-        with cache_lock:
-            stream_cache[song_id] = cdn_url
-
-        proxy_url = f"{RAILWAY_URL}/audio/{song_id}"
-
-        return jsonify({
-            "success": True,
-            "data": {
-                "id": song_data.get("id", song_id),
-                "title": song_data.get("song", query),
-                "artist": song_data.get("singers", "Unknown"),
-                "album": song_data.get("album", ""),
-                "artwork": song_data.get("image", ""),
-                "duration": duration_secs,
-                "url": proxy_url,
-                "ext": "mp4"
-            }
-        })
+        result = search_track(query)
+        if result:
+            return jsonify({"success": True, "data": result})
+        return jsonify({"success": False, "error": "No streamable results"}), 404
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route("/audio/<song_id>")
-def audio(song_id):
-    try:
-        # Fetch a fresh CDN URL every time (CDN URLs expire quickly)
-        cdn_url = get_fresh_stream_url(song_id)
-        if not cdn_url:
-            return jsonify({"error": "No stream URL"}), 404
-
-        # Redirect to CDN directly — ExoPlayer follows redirects automatically
-        # This avoids memory issues from proxying large audio files
-        from flask import redirect
-        return redirect(cdn_url, code=302)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "musical-api"})
+    return jsonify({"status": "ok", "service": "musical-api-soundcloud"})
 
 @app.route("/")
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "6.0.0"
+        "version": "7.0.0",
+        "source": "SoundCloud",
+        "endpoints": {
+            "/search?q=query": "Search tracks",
+            "/stream?q=query": "Get stream URL",
+            "/health": "Health check"
+        }
     })
 
 if __name__ == "__main__":
