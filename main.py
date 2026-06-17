@@ -38,14 +38,12 @@ def search_itunes(query, limit=20):
     return results
 
 def get_youtube_stream(title, artist, album=""):
-    # Build precise query using iTunes metadata
-    query = f"{title} {artist} {album} official audio"
-    query = query.strip()
-
+    query = f"{title} {artist} {album} official audio".strip()
+    
     ydl_opts = {
         "format": "bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
         "extract_flat": False,
         "default_search": "ytsearch1",
         "socket_timeout": 40,
@@ -56,41 +54,59 @@ def get_youtube_stream(title, artist, album=""):
         },
         "http_headers": {
             "User-Agent": "com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip",
-            "Accept-Language": "en-US,en;q=0.9",
         },
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-        if not info or "entries" not in info or not info["entries"]:
-            return None
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+            if not info:
+                app.logger.error(f"yt-dlp returned None for query: {query}")
+                return None
+            if "entries" not in info:
+                app.logger.error(f"No entries in response: {list(info.keys())}")
+                return None
+            if not info["entries"]:
+                app.logger.error(f"Empty entries for query: {query}")
+                return None
 
-        entry = info["entries"][0]
-        formats = entry.get("formats", [])
-
-        # Prefer audio-only
-        audio_formats = [
-            f for f in formats
-            if f.get("acodec") != "none"
-            and f.get("vcodec") == "none"
-            and f.get("url")
-        ]
-        if not audio_formats:
+            entry = info["entries"][0]
+            app.logger.info(f"Got entry: {entry.get('title')} | {entry.get('id')}")
+            
+            formats = entry.get("formats", [])
+            app.logger.info(f"Total formats: {len(formats)}")
+            
             audio_formats = [
                 f for f in formats
-                if f.get("acodec") != "none" and f.get("url")
+                if f.get("acodec") != "none"
+                and f.get("vcodec") == "none"
+                and f.get("url")
             ]
-        if not audio_formats:
-            return None
+            app.logger.info(f"Audio-only formats: {len(audio_formats)}")
+            
+            if not audio_formats:
+                audio_formats = [
+                    f for f in formats
+                    if f.get("acodec") != "none" and f.get("url")
+                ]
+                app.logger.info(f"Fallback audio formats: {len(audio_formats)}")
 
-        best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
-        proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(best["url"], safe="")
+            if not audio_formats:
+                app.logger.error("No audio formats found at all!")
+                return None
 
-        return {
-            "youtube_id": entry.get("id", ""),
-            "url": proxy_url,
-            "ext": best.get("ext", "webm")
-        }
+            best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
+            app.logger.info(f"Best format: {best.get('ext')} {best.get('abr')}kbps")
+            
+            proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(best["url"], safe="")
+            return {
+                "youtube_id": entry.get("id", ""),
+                "url": proxy_url,
+                "ext": best.get("ext", "webm")
+            }
+    except Exception as e:
+        app.logger.error(f"yt-dlp exception: {type(e).__name__}: {str(e)}")
+        return None
 
 @app.route("/search")
 def search():
@@ -114,8 +130,6 @@ def stream():
         return jsonify({"success": False, "error": "No query"}), 400
 
     try:
-        # If title+artist provided, use them directly for precise YouTube search
-        # Otherwise search iTunes first to get metadata
         if title and artist:
             itunes_results = search_itunes(f"{title} {artist}", limit=1)
             itunes_song = itunes_results[0] if itunes_results else None
@@ -131,12 +145,19 @@ def stream():
             search_artist = itunes_song["artist"]
             search_album = itunes_song["album"]
 
-        # Get YouTube stream URL
         stream_data = get_youtube_stream(search_title, search_artist, search_album)
         if not stream_data:
-            return jsonify({"success": False, "error": "No YouTube stream found"}), 404
+            # Try simpler query as fallback
+            stream_data = get_youtube_stream(search_title, search_artist)
+        if not stream_data:
+            # Last resort - just title
+            stream_data = get_youtube_stream(search_title, "")
+        if not stream_data:
+            return jsonify({
+                "success": False,
+                "error": "YouTube stream failed - check Railway logs"
+            }), 404
 
-        # Combine iTunes metadata + YouTube audio
         result = {
             "id": itunes_song["id"] if itunes_song else search_title,
             "title": itunes_song["title"] if itunes_song else search_title,
