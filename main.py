@@ -1,24 +1,30 @@
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, Response
 import requests
 
 app = Flask(__name__)
 
 CLIENT_ID = "9RxIC6NwiaJEj6SsGAJgmHYOYauqhn9E"
 SC_BASE = "https://api-v2.soundcloud.com"
+RAILWAY_URL = "https://web-production-7318d.up.railway.app"
 
-HEADERS = {
+SC_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Origin": "https://soundcloud.com",
     "Referer": "https://soundcloud.com/"
 }
 
+CDN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://soundcloud.com/",
+    "Origin": "https://soundcloud.com"
+}
+
 def get_stream_url(transcoding_url):
-    """Resolve transcoding URL to actual stream URL"""
     resp = requests.get(
         transcoding_url,
         params={"client_id": CLIENT_ID},
-        headers=HEADERS,
+        headers=SC_HEADERS,
         timeout=10
     )
     if resp.status_code == 200:
@@ -26,7 +32,6 @@ def get_stream_url(transcoding_url):
     return None
 
 def search_track(query):
-    """Search SoundCloud and return best matching track with stream URL"""
     resp = requests.get(
         f"{SC_BASE}/search/tracks",
         params={
@@ -35,7 +40,7 @@ def search_track(query):
             "limit": 5,
             "offset": 0
         },
-        headers=HEADERS,
+        headers=SC_HEADERS,
         timeout=15
     )
     if resp.status_code != 200:
@@ -46,7 +51,6 @@ def search_track(query):
     if not tracks:
         return None
 
-    # Find first streamable track
     for track in tracks:
         if not track.get("streamable"):
             continue
@@ -55,26 +59,29 @@ def search_track(query):
 
         transcodings = track.get("media", {}).get("transcodings", [])
 
-        # Prefer progressive MP3 stream
-        stream_url = None
+        # Prefer progressive MP3
+        raw_stream_url = None
         for t in transcodings:
             fmt = t.get("format", {})
             if fmt.get("protocol") == "progressive" and "mpeg" in fmt.get("mime_type", ""):
-                stream_url = get_stream_url(t["url"])
+                raw_stream_url = get_stream_url(t["url"])
                 break
 
-        # Fallback to HLS
-        if not stream_url:
+        # Fallback to any transcoding
+        if not raw_stream_url:
             for t in transcodings:
-                stream_url = get_stream_url(t["url"])
-                if stream_url:
+                raw_stream_url = get_stream_url(t["url"])
+                if raw_stream_url:
                     break
 
-        if not stream_url:
+        if not raw_stream_url:
             continue
 
         artwork = track.get("artwork_url", "") or ""
-        artwork = artwork.replace("large", "t500x500")  # Get high res
+        artwork = artwork.replace("large", "t500x500")
+
+        # Route audio through our proxy
+        proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(raw_stream_url, safe="")
 
         return {
             "id": str(track.get("id", "")),
@@ -83,7 +90,7 @@ def search_track(query):
             "album": "",
             "artwork": artwork,
             "duration": (track.get("duration", 0) or 0) // 1000,
-            "url": stream_url,
+            "url": proxy_url,
             "ext": "mp3"
         }
     return None
@@ -97,7 +104,7 @@ def search():
         resp = requests.get(
             f"{SC_BASE}/search/tracks",
             params={"q": query, "client_id": CLIENT_ID, "limit": 20},
-            headers=HEADERS,
+            headers=SC_HEADERS,
             timeout=15
         )
         if resp.status_code != 200:
@@ -134,6 +141,45 @@ def stream():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route("/audio")
+def audio():
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "No URL"}), 400
+    try:
+        range_header = request.headers.get("Range", None)
+        req_headers = dict(CDN_HEADERS)
+        if range_header:
+            req_headers["Range"] = range_header
+
+        resp = requests.get(
+            url,
+            headers=req_headers,
+            stream=True,
+            timeout=60
+        )
+
+        excluded = {"transfer-encoding", "connection", "keep-alive", "content-encoding"}
+        response_headers = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() not in excluded
+        }
+        response_headers["Accept-Ranges"] = "bytes"
+        response_headers["Access-Control-Allow-Origin"] = "*"
+
+        def generate():
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
+
+        return Response(
+            generate(),
+            status=resp.status_code,
+            headers=response_headers
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "service": "musical-api-soundcloud"})
@@ -142,11 +188,12 @@ def health():
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "7.0.0",
+        "version": "8.0.0",
         "source": "SoundCloud",
         "endpoints": {
             "/search?q=query": "Search tracks",
-            "/stream?q=query": "Get stream URL",
+            "/stream?q=query": "Get proxied stream URL",
+            "/audio?url=encoded_url": "Proxy audio stream",
             "/health": "Health check"
         }
     })
