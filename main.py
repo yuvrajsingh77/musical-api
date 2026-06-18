@@ -63,79 +63,119 @@ def get_sc_stream_url(transcoding_url):
         app.logger.error(f"SC transcoding error: {e}")
     return None
 
-def search_soundcloud(title, artist):
-    """Search SoundCloud with iTunes-guided query for better results"""
-    # Try multiple query strategies from most specific to least
-    queries = [
-        f"{title} {artist}",
-        f"{title} {artist.split(',')[0].strip()}",  # First artist only
-        f"{title}",
-    ]
-
-    for query in queries:
-        try:
-            app.logger.info(f"Trying SoundCloud query: {query}")
-            resp = requests.get(
-                f"{SC_BASE}/search/tracks",
-                params={
-                    "q": query,
-                    "client_id": CLIENT_ID,
-                    "limit": 10,
-                    "offset": 0
-                },
-                headers=SC_HEADERS,
-                timeout=15
-            )
-            if resp.status_code != 200:
-                app.logger.error(f"SC search returned {resp.status_code}")
-                continue
-
-            tracks = resp.json().get("collection", [])
-            app.logger.info(f"SC returned {len(tracks)} tracks for: {query}")
-
-            for track in tracks:
-                if not track.get("streamable"):
-                    continue
-                if track.get("policy") == "BLOCK":
-                    continue
-
-                transcodings = track.get("media", {}).get("transcodings", [])
-
-                # Prefer progressive MP3
-                raw_url = None
-                for t in transcodings:
-                    fmt = t.get("format", {})
-                    if fmt.get("protocol") == "progressive" and "mpeg" in fmt.get("mime_type", ""):
-                        raw_url = get_sc_stream_url(t["url"])
-                        break
-
-                # Fallback to any format
-                if not raw_url:
-                    for t in transcodings:
-                        raw_url = get_sc_stream_url(t["url"])
-                        if raw_url:
-                            break
-
-                if not raw_url:
-                    continue
-
-                artwork = (track.get("artwork_url") or "").replace("large", "t500x500")
-                proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(raw_url, safe="")
-
-                app.logger.info(f"Got SC stream for: {track.get('title')}")
-                return {
-                    "sc_id": str(track.get("id", "")),
-                    "sc_title": track.get("title", ""),
-                    "sc_artwork": artwork,
-                    "url": proxy_url,
-                    "duration": (track.get("duration", 0) or 0) // 1000
+def search_youtube_music_id(query):
+    """Search YouTube Music for video ID"""
+    try:
+        # YouTube Music internal API
+        url = "https://music.youtube.com/youtubei/v1/search"
+        params = {"key": "AIzaSyC9XL3ZjWddXya6X74dJoCTL-NKNELL6tv"}
+        payload = {
+            "query": query,
+            "context": {
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": "1.20220727.01.00",
+                    "hl": "en",
+                    "gl": "IN"
                 }
-        except Exception as e:
-            app.logger.error(f"SC search exception: {e}")
-            continue
+            }
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json",
+            "Referer": "https://music.youtube.com/",
+            "Origin": "https://music.youtube.com"
+        }
+        resp = requests.post(
+            url,
+            params=params,
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        if resp.status_code != 200:
+            app.logger.error(f"YTMusic API: {resp.status_code}")
+            return None
 
-    return None
+        # Parse response to find video IDs
+        import re
+        data = resp.text
+        video_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', data)
+        
+        seen = set()
+        for vid in video_ids:
+            if vid not in seen:
+                seen.add(vid)
+                app.logger.info(f"Found YTMusic video ID: {vid}")
+                return vid
 
+        return None
+    except Exception as e:
+        app.logger.error(f"YTMusic search error: {e}")
+        return None
+
+def get_youtube_stream(title, artist, album=""):
+    query = f"{title} {artist}".strip()
+    app.logger.info(f"Searching YouTube Music for: {query}")
+
+    video_id = search_youtube_music_id(query)
+    if not video_id:
+        app.logger.error(f"No video ID found")
+        return None
+
+    app.logger.info(f"Got video ID: {video_id}")
+    video_url = f"https://music.youtube.com/watch?v={video_id}"
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "quiet": False,
+        "no_warnings": False,
+        "socket_timeout": 40,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web_music"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://music.youtube.com/",
+            "Origin": "https://music.youtube.com"
+        },
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            if not info:
+                return None
+
+            formats = info.get("formats", [])
+            audio_formats = [
+                f for f in formats
+                if f.get("acodec") != "none"
+                and f.get("vcodec") == "none"
+                and f.get("url")
+            ]
+            if not audio_formats:
+                audio_formats = [
+                    f for f in formats
+                    if f.get("acodec") != "none" and f.get("url")
+                ]
+            if not audio_formats:
+                return None
+
+            best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
+            app.logger.info(f"Best: {best.get('ext')} {best.get('abr')}kbps")
+
+            proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(best["url"], safe="")
+            return {
+                "youtube_id": video_id,
+                "url": proxy_url,
+                "ext": best.get("ext", "webm")
+            }
+    except Exception as e:
+        app.logger.error(f"yt-dlp error: {type(e).__name__}: {str(e)}")
+        return None
 @app.route("/search")
 def search():
     query = request.args.get("q", "").strip()
