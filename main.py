@@ -38,45 +38,77 @@ def search_itunes(query, limit=20):
     return results
 
 def search_youtube_id(query):
-    """Get YouTube video ID using web scraping — no API needed"""
-    search_query = requests.utils.quote(query)
-    url = f"https://www.youtube.com/results?search_query={search_query}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        return None
+    """Use YouTube's internal web API to search"""
+    try:
+        url = "https://www.youtube.com/youtubei/v1/search"
+        params = {"key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"}
+        payload = {
+            "query": query,
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20220801.00.00",
+                    "hl": "en",
+                    "gl": "IN"
+                }
+            }
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-YouTube-Client-Name": "1",
+            "X-YouTube-Client-Version": "2.20220801.00.00"
+        }
+        resp = requests.post(
+            url,
+            params=params,
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        if resp.status_code != 200:
+            app.logger.error(f"YouTube API returned {resp.status_code}")
+            return None
 
-    # Extract video IDs from YouTube search results page
-    import re
-    video_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
-    # Return first unique video ID
-    seen = set()
-    for vid in video_ids:
-        if vid not in seen:
-            seen.add(vid)
-            return vid
-    return None
+        data = resp.json()
+        contents = (
+            data.get("contents", {})
+            .get("twoColumnSearchResultsRenderer", {})
+            .get("primaryContents", {})
+            .get("sectionListRenderer", {})
+            .get("contents", [])
+        )
+        for section in contents:
+            items = section.get("itemSectionRenderer", {}).get("contents", [])
+            for item in items:
+                video = item.get("videoRenderer", {})
+                video_id = video.get("videoId")
+                if video_id:
+                    title = video.get("title", {}).get("runs", [{}])[0].get("text", "")
+                    app.logger.info(f"Found video: {video_id} - {title}")
+                    return video_id
+
+        app.logger.error("No video IDs found in YouTube API response")
+        return None
+    except Exception as e:
+        app.logger.error(f"YouTube API search error: {e}")
+        return None
 
 def get_youtube_stream(title, artist, album=""):
     query = f"{title} {artist} official audio".strip()
     app.logger.info(f"Searching YouTube for: {query}")
 
-    # Step 1: Get video ID via web scraping
     video_id = search_youtube_id(query)
     if not video_id:
-        # Try simpler query
         video_id = search_youtube_id(f"{title} {artist}")
     if not video_id:
-        app.logger.error(f"Could not find YouTube video ID for: {query}")
+        app.logger.error(f"No video ID found for: {query}")
         return None
 
     app.logger.info(f"Found video ID: {video_id}")
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # Step 2: Extract stream URL using direct video URL
     ydl_opts = {
         "format": "bestaudio/best",
         "quiet": False,
@@ -96,11 +128,11 @@ def get_youtube_stream(title, artist, album=""):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             if not info:
-                app.logger.error(f"yt-dlp returned None for: {video_url}")
+                app.logger.error("yt-dlp returned None")
                 return None
 
             formats = info.get("formats", [])
-            app.logger.info(f"Got {len(formats)} formats for {info.get('title')}")
+            app.logger.info(f"Got {len(formats)} formats")
 
             audio_formats = [
                 f for f in formats
@@ -113,13 +145,12 @@ def get_youtube_stream(title, artist, album=""):
                     f for f in formats
                     if f.get("acodec") != "none" and f.get("url")
                 ]
-
             if not audio_formats:
-                app.logger.error("No audio formats found!")
+                app.logger.error("No audio formats found")
                 return None
 
             best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
-            app.logger.info(f"Best audio: {best.get('ext')} {best.get('abr')}kbps")
+            app.logger.info(f"Best: {best.get('ext')} {best.get('abr')}kbps")
 
             proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(best["url"], safe="")
             return {
@@ -170,10 +201,8 @@ def stream():
 
         stream_data = get_youtube_stream(search_title, search_artist, search_album)
         if not stream_data:
-            # Try simpler query as fallback
             stream_data = get_youtube_stream(search_title, search_artist)
         if not stream_data:
-            # Last resort - just title
             stream_data = get_youtube_stream(search_title, "")
         if not stream_data:
             return jsonify({
@@ -244,12 +273,11 @@ def health():
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "10.0.0",
+        "version": "11.0.0",
         "source": "iTunes (metadata) + YouTube (audio)",
         "endpoints": {
             "/search?q=query": "Search via iTunes",
-            "/stream?q=query": "Get stream (iTunes metadata + YouTube audio)",
-            "/stream?title=X&artist=Y&album=Z": "Get stream with exact metadata",
+            "/stream?title=X&artist=Y": "Get stream URL",
             "/audio?url=encoded_url": "Proxy audio",
             "/health": "Health check"
         }
