@@ -37,15 +37,50 @@ def search_itunes(query, limit=20):
         })
     return results
 
+def search_youtube_id(query):
+    """Get YouTube video ID using web scraping — no API needed"""
+    search_query = requests.utils.quote(query)
+    url = f"https://www.youtube.com/results?search_query={search_query}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return None
+
+    # Extract video IDs from YouTube search results page
+    import re
+    video_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
+    # Return first unique video ID
+    seen = set()
+    for vid in video_ids:
+        if vid not in seen:
+            seen.add(vid)
+            return vid
+    return None
+
 def get_youtube_stream(title, artist, album=""):
-    query = f"{title} {artist} {album} official audio".strip()
-    
+    query = f"{title} {artist} official audio".strip()
+    app.logger.info(f"Searching YouTube for: {query}")
+
+    # Step 1: Get video ID via web scraping
+    video_id = search_youtube_id(query)
+    if not video_id:
+        # Try simpler query
+        video_id = search_youtube_id(f"{title} {artist}")
+    if not video_id:
+        app.logger.error(f"Could not find YouTube video ID for: {query}")
+        return None
+
+    app.logger.info(f"Found video ID: {video_id}")
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Step 2: Extract stream URL using direct video URL
     ydl_opts = {
         "format": "bestaudio/best",
         "quiet": False,
         "no_warnings": False,
-        "extract_flat": False,
-        "default_search": "ytsearch1",
         "socket_timeout": 40,
         "extractor_args": {
             "youtube": {
@@ -59,53 +94,41 @@ def get_youtube_stream(title, artist, album=""):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+            info = ydl.extract_info(video_url, download=False)
             if not info:
-                app.logger.error(f"yt-dlp returned None for query: {query}")
-                return None
-            if "entries" not in info:
-                app.logger.error(f"No entries in response: {list(info.keys())}")
-                return None
-            if not info["entries"]:
-                app.logger.error(f"Empty entries for query: {query}")
+                app.logger.error(f"yt-dlp returned None for: {video_url}")
                 return None
 
-            entry = info["entries"][0]
-            app.logger.info(f"Got entry: {entry.get('title')} | {entry.get('id')}")
-            
-            formats = entry.get("formats", [])
-            app.logger.info(f"Total formats: {len(formats)}")
-            
+            formats = info.get("formats", [])
+            app.logger.info(f"Got {len(formats)} formats for {info.get('title')}")
+
             audio_formats = [
                 f for f in formats
                 if f.get("acodec") != "none"
                 and f.get("vcodec") == "none"
                 and f.get("url")
             ]
-            app.logger.info(f"Audio-only formats: {len(audio_formats)}")
-            
             if not audio_formats:
                 audio_formats = [
                     f for f in formats
                     if f.get("acodec") != "none" and f.get("url")
                 ]
-                app.logger.info(f"Fallback audio formats: {len(audio_formats)}")
 
             if not audio_formats:
-                app.logger.error("No audio formats found at all!")
+                app.logger.error("No audio formats found!")
                 return None
 
             best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
-            app.logger.info(f"Best format: {best.get('ext')} {best.get('abr')}kbps")
-            
+            app.logger.info(f"Best audio: {best.get('ext')} {best.get('abr')}kbps")
+
             proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(best["url"], safe="")
             return {
-                "youtube_id": entry.get("id", ""),
+                "youtube_id": video_id,
                 "url": proxy_url,
                 "ext": best.get("ext", "webm")
             }
     except Exception as e:
-        app.logger.error(f"yt-dlp exception: {type(e).__name__}: {str(e)}")
+        app.logger.error(f"yt-dlp error: {type(e).__name__}: {str(e)}")
         return None
 
 @app.route("/search")
