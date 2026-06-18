@@ -1,166 +1,140 @@
 from flask import Flask, request, jsonify, Response
 import requests
-import yt_dlp
 
 app = Flask(__name__)
 
 RAILWAY_URL = "https://web-production-7318d.up.railway.app"
 ITUNES_BASE = "https://itunes.apple.com"
+SC_BASE = "https://api-v2.soundcloud.com"
+CLIENT_ID = "9RxIC6NwiaJEj6SsGAJgmHYOYauqhn9E"
+
+SC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Origin": "https://soundcloud.com",
+    "Referer": "https://soundcloud.com/"
+}
 
 def search_itunes(query, limit=20):
-    resp = requests.get(
-        f"{ITUNES_BASE}/search",
-        params={
-            "term": query,
-            "media": "music",
-            "entity": "song",
-            "limit": limit,
-            "country": "IN"
-        },
-        timeout=10
-    )
-    if resp.status_code != 200:
-        return []
-    results = []
-    for t in resp.json().get("results", []):
-        if t.get("kind") != "song":
-            continue
-        artwork = t.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
-        results.append({
-            "id": str(t.get("trackId", "")),
-            "title": t.get("trackName", "Unknown"),
-            "artist": t.get("artistName", "Unknown"),
-            "album": t.get("collectionName", ""),
-            "artwork": artwork,
-            "duration": (t.get("trackTimeMillis", 0) or 0) // 1000,
-            "genre": t.get("primaryGenreName", "")
-        })
-    return results
-
-def search_youtube_id(query):
-    """Use YouTube's internal web API to search"""
     try:
-        url = "https://www.youtube.com/youtubei/v1/search"
-        params = {"key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"}
-        payload = {
-            "query": query,
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": "2.20220801.00.00",
-                    "hl": "en",
-                    "gl": "IN"
-                }
-            }
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Content-Type": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "X-YouTube-Client-Name": "1",
-            "X-YouTube-Client-Version": "2.20220801.00.00"
-        }
-        resp = requests.post(
-            url,
-            params=params,
-            json=payload,
-            headers=headers,
-            timeout=15
+        resp = requests.get(
+            f"{ITUNES_BASE}/search",
+            params={
+                "term": query,
+                "media": "music",
+                "entity": "song",
+                "limit": limit,
+                "country": "IN"
+            },
+            timeout=10
         )
         if resp.status_code != 200:
-            app.logger.error(f"YouTube API returned {resp.status_code}")
-            return None
-
-        data = resp.json()
-        contents = (
-            data.get("contents", {})
-            .get("twoColumnSearchResultsRenderer", {})
-            .get("primaryContents", {})
-            .get("sectionListRenderer", {})
-            .get("contents", [])
-        )
-        for section in contents:
-            items = section.get("itemSectionRenderer", {}).get("contents", [])
-            for item in items:
-                video = item.get("videoRenderer", {})
-                video_id = video.get("videoId")
-                if video_id:
-                    title = video.get("title", {}).get("runs", [{}])[0].get("text", "")
-                    app.logger.info(f"Found video: {video_id} - {title}")
-                    return video_id
-
-        app.logger.error("No video IDs found in YouTube API response")
-        return None
+            return []
+        results = []
+        for t in resp.json().get("results", []):
+            if t.get("kind") != "song":
+                continue
+            artwork = t.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+            results.append({
+                "id": str(t.get("trackId", "")),
+                "title": t.get("trackName", "Unknown"),
+                "artist": t.get("artistName", "Unknown"),
+                "album": t.get("collectionName", ""),
+                "artwork": artwork,
+                "duration": (t.get("trackTimeMillis", 0) or 0) // 1000,
+                "genre": t.get("primaryGenreName", "")
+            })
+        return results
     except Exception as e:
-        app.logger.error(f"YouTube API search error: {e}")
-        return None
+        app.logger.error(f"iTunes search error: {e}")
+        return []
 
-def get_youtube_stream(title, artist, album=""):
-    query = f"{title} {artist} official audio".strip()
-    app.logger.info(f"Searching YouTube for: {query}")
-
-    video_id = search_youtube_id(query)
-    if not video_id:
-        video_id = search_youtube_id(f"{title} {artist}")
-    if not video_id:
-        app.logger.error(f"No video ID found for: {query}")
-        return None
-
-    app.logger.info(f"Found video ID: {video_id}")
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "quiet": False,
-        "no_warnings": False,
-        "socket_timeout": 40,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios"],
-            }
-        },
-        "http_headers": {
-            "User-Agent": "com.google.android.youtube/17.31.35 (Linux; U; Android 11) gzip",
-        },
-    }
-
+def get_sc_stream_url(transcoding_url):
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            if not info:
-                app.logger.error("yt-dlp returned None")
-                return None
-
-            formats = info.get("formats", [])
-            app.logger.info(f"Got {len(formats)} formats")
-
-            audio_formats = [
-                f for f in formats
-                if f.get("acodec") != "none"
-                and f.get("vcodec") == "none"
-                and f.get("url")
-            ]
-            if not audio_formats:
-                audio_formats = [
-                    f for f in formats
-                    if f.get("acodec") != "none" and f.get("url")
-                ]
-            if not audio_formats:
-                app.logger.error("No audio formats found")
-                return None
-
-            best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
-            app.logger.info(f"Best: {best.get('ext')} {best.get('abr')}kbps")
-
-            proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(best["url"], safe="")
-            return {
-                "youtube_id": video_id,
-                "url": proxy_url,
-                "ext": best.get("ext", "webm")
-            }
+        resp = requests.get(
+            transcoding_url,
+            params={"client_id": CLIENT_ID},
+            headers=SC_HEADERS,
+            timeout=10
+        )
+        if resp.status_code == 200:
+            return resp.json().get("url")
     except Exception as e:
-        app.logger.error(f"yt-dlp error: {type(e).__name__}: {str(e)}")
-        return None
+        app.logger.error(f"SC transcoding error: {e}")
+    return None
+
+def search_soundcloud(title, artist):
+    """Search SoundCloud with iTunes-guided query for better results"""
+    # Try multiple query strategies from most specific to least
+    queries = [
+        f"{title} {artist}",
+        f"{title} {artist.split(',')[0].strip()}",  # First artist only
+        f"{title}",
+    ]
+
+    for query in queries:
+        try:
+            app.logger.info(f"Trying SoundCloud query: {query}")
+            resp = requests.get(
+                f"{SC_BASE}/search/tracks",
+                params={
+                    "q": query,
+                    "client_id": CLIENT_ID,
+                    "limit": 10,
+                    "offset": 0
+                },
+                headers=SC_HEADERS,
+                timeout=15
+            )
+            if resp.status_code != 200:
+                app.logger.error(f"SC search returned {resp.status_code}")
+                continue
+
+            tracks = resp.json().get("collection", [])
+            app.logger.info(f"SC returned {len(tracks)} tracks for: {query}")
+
+            for track in tracks:
+                if not track.get("streamable"):
+                    continue
+                if track.get("policy") == "BLOCK":
+                    continue
+
+                transcodings = track.get("media", {}).get("transcodings", [])
+
+                # Prefer progressive MP3
+                raw_url = None
+                for t in transcodings:
+                    fmt = t.get("format", {})
+                    if fmt.get("protocol") == "progressive" and "mpeg" in fmt.get("mime_type", ""):
+                        raw_url = get_sc_stream_url(t["url"])
+                        break
+
+                # Fallback to any format
+                if not raw_url:
+                    for t in transcodings:
+                        raw_url = get_sc_stream_url(t["url"])
+                        if raw_url:
+                            break
+
+                if not raw_url:
+                    continue
+
+                artwork = (track.get("artwork_url") or "").replace("large", "t500x500")
+                proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(raw_url, safe="")
+
+                app.logger.info(f"Got SC stream for: {track.get('title')}")
+                return {
+                    "sc_id": str(track.get("id", "")),
+                    "sc_title": track.get("title", ""),
+                    "sc_artwork": artwork,
+                    "url": proxy_url,
+                    "duration": (track.get("duration", 0) or 0) // 1000
+                }
+        except Exception as e:
+            app.logger.error(f"SC search exception: {e}")
+            continue
+
+    return None
 
 @app.route("/search")
 def search():
@@ -175,53 +149,55 @@ def search():
 
 @app.route("/stream")
 def stream():
-    query = request.args.get("q", "").strip()
     title = request.args.get("title", "").strip()
     artist = request.args.get("artist", "").strip()
-    album = request.args.get("album", "").strip()
+    query = request.args.get("q", "").strip()
 
-    if not query and not title:
-        return jsonify({"success": False, "error": "No query"}), 400
+    if not title and not query:
+        return jsonify({"success": False, "error": "Provide title+artist or q"}), 400
 
     try:
+        # Step 1: Get iTunes metadata
         if title and artist:
             itunes_results = search_itunes(f"{title} {artist}", limit=1)
-            itunes_song = itunes_results[0] if itunes_results else None
-            search_title = title
-            search_artist = artist
-            search_album = album
         else:
             itunes_results = search_itunes(query, limit=1)
-            if not itunes_results:
-                return jsonify({"success": False, "error": "No iTunes results"}), 404
+
+        if itunes_results:
             itunes_song = itunes_results[0]
             search_title = itunes_song["title"]
             search_artist = itunes_song["artist"]
-            search_album = itunes_song["album"]
+        else:
+            # Use provided params directly
+            itunes_song = None
+            search_title = title or query
+            search_artist = artist
 
-        stream_data = get_youtube_stream(search_title, search_artist, search_album)
-        if not stream_data:
-            stream_data = get_youtube_stream(search_title, search_artist)
-        if not stream_data:
-            stream_data = get_youtube_stream(search_title, "")
-        if not stream_data:
+        app.logger.info(f"Searching SC for: {search_title} - {search_artist}")
+
+        # Step 2: Search SoundCloud with iTunes metadata
+        sc_data = search_soundcloud(search_title, search_artist)
+        if not sc_data:
             return jsonify({
                 "success": False,
-                "error": "YouTube stream failed - check Railway logs"
+                "error": f"No SoundCloud stream found for: {search_title} {search_artist}"
             }), 404
 
+        # Step 3: Combine iTunes metadata + SoundCloud audio
         result = {
             "id": itunes_song["id"] if itunes_song else search_title,
             "title": itunes_song["title"] if itunes_song else search_title,
             "artist": itunes_song["artist"] if itunes_song else search_artist,
-            "album": itunes_song["album"] if itunes_song else search_album,
-            "artwork": itunes_song["artwork"] if itunes_song else "",
-            "duration": itunes_song["duration"] if itunes_song else 0,
-            "url": stream_data["url"],
-            "ext": stream_data["ext"]
+            "album": itunes_song["album"] if itunes_song else "",
+            "artwork": itunes_song["artwork"] if itunes_song else sc_data.get("sc_artwork", ""),
+            "duration": itunes_song["duration"] if itunes_song else sc_data.get("duration", 0),
+            "url": sc_data["url"],
+            "ext": "mp3"
         }
         return jsonify({"success": True, "data": result})
+
     except Exception as e:
+        app.logger.error(f"Stream error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/audio")
@@ -233,6 +209,8 @@ def audio():
         range_header = request.headers.get("Range", None)
         req_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://soundcloud.com/",
+            "Origin": "https://soundcloud.com"
         }
         if range_header:
             req_headers["Range"] = range_header
@@ -267,17 +245,17 @@ def audio():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "musical-api-itunes-yt"})
+    return jsonify({"status": "ok", "service": "musical-api-itunes-sc"})
 
 @app.route("/")
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "11.0.0",
-        "source": "iTunes (metadata) + YouTube (audio)",
+        "version": "12.0.0",
+        "source": "iTunes (metadata) + SoundCloud (audio via Railway proxy)",
         "endpoints": {
             "/search?q=query": "Search via iTunes",
-            "/stream?title=X&artist=Y": "Get stream URL",
+            "/stream?title=X&artist=Y": "Get stream",
             "/audio?url=encoded_url": "Proxy audio",
             "/health": "Health check"
         }
