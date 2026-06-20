@@ -43,18 +43,22 @@ def search_itunes(query, limit=20):
         return []
 
 def search_youtube_music_id(query):
-    """Search YouTube Music internal API for video ID"""
+    """Search YouTube Music - try multiple approaches"""
+
+    # Approach 1: YouTube Music API
     try:
         url = "https://music.youtube.com/youtubei/v1/search"
-        params = {"key": "AIzaSyC9XL3ZjWddXya6X74dJoCTL-NKNELL6tv"}
+        params = {"key": "AIzaSyC9XL3ZjWddXya6X74dJoCTL-NKNELL6tv", "prettyPrint": "false"}
         payload = {
             "query": query,
+            "params": "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D",
             "context": {
                 "client": {
                     "clientName": "WEB_REMIX",
-                    "clientVersion": "1.20220727.01.00",
+                    "clientVersion": "1.20230501.01.00",
                     "hl": "en",
-                    "gl": "IN"
+                    "gl": "US",
+                    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 }
             }
         }
@@ -62,45 +66,78 @@ def search_youtube_music_id(query):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Content-Type": "application/json",
             "Referer": "https://music.youtube.com/",
-            "Origin": "https://music.youtube.com"
+            "Origin": "https://music.youtube.com",
+            "X-YouTube-Client-Name": "67",
+            "X-YouTube-Client-Version": "1.20230501.01.00"
         }
         resp = requests.post(
-            url,
-            params=params,
-            json=payload,
-            headers=headers,
-            timeout=15
+            url, params=params, json=payload, headers=headers, timeout=15
         )
-        if resp.status_code != 200:
-            app.logger.error(f"YTMusic API: {resp.status_code}")
-            return None
-
-        video_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
-        seen = set()
-        for vid in video_ids:
-            if vid not in seen:
-                seen.add(vid)
-                app.logger.info(f"Found YTMusic ID: {vid}")
-                return vid
-
-        app.logger.error("No video IDs in YTMusic response")
-        return None
+        app.logger.info(f"YTMusic API status: {resp.status_code}")
+        if resp.status_code == 200:
+            text = resp.text
+            ids = re.findall(r'"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"', text)
+            ids2 = re.findall(r'videoId":"([a-zA-Z0-9_-]{11})"', text)
+            all_ids = list(dict.fromkeys(ids + ids2))
+            app.logger.info(f"Found {len(all_ids)} video IDs in YTMusic response")
+            if all_ids:
+                app.logger.info(f"First ID: {all_ids[0]}")
+                return all_ids[0]
+            else:
+                app.logger.error(f"YTMusic response preview: {text[:500]}")
     except Exception as e:
-        app.logger.error(f"YTMusic search error: {e}")
-        return None
+        app.logger.error(f"YTMusic API error: {e}")
+
+    # Approach 2: Regular YouTube search API
+    try:
+        url2 = "https://www.youtube.com/youtubei/v1/search"
+        params2 = {"key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"}
+        payload2 = {
+            "query": f"{query} audio",
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20230501.00.00",
+                    "hl": "en",
+                    "gl": "IN"
+                }
+            }
+        }
+        headers2 = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json"
+        }
+        resp2 = requests.post(
+            url2, params=params2, json=payload2, headers=headers2, timeout=15
+        )
+        app.logger.info(f"YouTube API status: {resp2.status_code}")
+        if resp2.status_code == 200:
+            text2 = resp2.text
+            ids3 = re.findall(r'"videoId"\s*:\s*"([a-zA-Z0-9_-]{11})"', text2)
+            unique = list(dict.fromkeys(ids3))
+            app.logger.info(f"Found {len(unique)} IDs from YouTube API")
+            if unique:
+                app.logger.info(f"First YouTube ID: {unique[0]}")
+                return unique[0]
+            else:
+                app.logger.error(f"YouTube response preview: {text2[:500]}")
+    except Exception as e:
+        app.logger.error(f"YouTube API error: {e}")
+
+    return None
 
 def get_stream(title, artist):
     query = f"{title} {artist}".strip()
-    app.logger.info(f"Searching YouTube Music for: {query}")
+    app.logger.info(f"Getting stream for: {query}")
 
     video_id = search_youtube_music_id(query)
     if not video_id:
         video_id = search_youtube_music_id(title)
     if not video_id:
-        app.logger.error("No video ID found")
+        app.logger.error("No video ID found from any source")
         return None
 
-    app.logger.info(f"Got video ID: {video_id}")
+    app.logger.info(f"Using video ID: {video_id}")
     video_url = f"https://music.youtube.com/watch?v={video_id}"
 
     ydl_opts = {
@@ -146,7 +183,7 @@ def get_stream(title, artist):
                 return None
 
             best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
-            app.logger.info(f"Best: {best.get('ext')} {best.get('abr')}kbps")
+            app.logger.info(f"Best format: {best.get('ext')} {best.get('abr')}kbps")
 
             proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(best["url"], safe="")
             return {
@@ -179,7 +216,6 @@ def stream():
         return jsonify({"success": False, "error": "Provide title+artist or q"}), 400
 
     try:
-        # Step 1: Get iTunes metadata
         if title and artist:
             itunes_results = search_itunes(f"{title} {artist}", limit=1)
         else:
@@ -194,17 +230,17 @@ def stream():
             search_title = title or query
             search_artist = artist
 
-        app.logger.info(f"iTunes: {search_title} - {search_artist}")
+        app.logger.info(f"iTunes result: {search_title} - {search_artist}")
 
-        # Step 2: Get YouTube Music stream
         stream_data = get_stream(search_title, search_artist)
+        if not stream_data:
+            stream_data = get_stream(search_title, "")
         if not stream_data:
             return jsonify({
                 "success": False,
                 "error": f"No stream found for: {search_title} {search_artist}"
             }), 404
 
-        # Step 3: Combine iTunes metadata + YouTube Music audio
         result = {
             "id": itunes_song["id"] if itunes_song else search_title,
             "title": itunes_song["title"] if itunes_song else search_title,
@@ -272,7 +308,7 @@ def health():
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "13.0.0",
+        "version": "14.0.0",
         "source": "iTunes (metadata) + YouTube Music (audio)",
         "endpoints": {
             "/search?q=query": "Search via iTunes",
