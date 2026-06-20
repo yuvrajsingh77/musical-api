@@ -1,19 +1,12 @@
 from flask import Flask, request, jsonify, Response
 import requests
+import yt_dlp
+import re
 
 app = Flask(__name__)
 
 RAILWAY_URL = "https://web-production-7318d.up.railway.app"
 ITUNES_BASE = "https://itunes.apple.com"
-SC_BASE = "https://api-v2.soundcloud.com"
-CLIENT_ID = "9RxIC6NwiaJEj6SsGAJgmHYOYauqhn9E"
-
-SC_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
-    "Origin": "https://soundcloud.com",
-    "Referer": "https://soundcloud.com/"
-}
 
 def search_itunes(query, limit=20):
     try:
@@ -46,27 +39,12 @@ def search_itunes(query, limit=20):
             })
         return results
     except Exception as e:
-        app.logger.error(f"iTunes search error: {e}")
+        app.logger.error(f"iTunes error: {e}")
         return []
 
-def get_sc_stream_url(transcoding_url):
-    try:
-        resp = requests.get(
-            transcoding_url,
-            params={"client_id": CLIENT_ID},
-            headers=SC_HEADERS,
-            timeout=10
-        )
-        if resp.status_code == 200:
-            return resp.json().get("url")
-    except Exception as e:
-        app.logger.error(f"SC transcoding error: {e}")
-    return None
-
 def search_youtube_music_id(query):
-    """Search YouTube Music for video ID"""
+    """Search YouTube Music internal API for video ID"""
     try:
-        # YouTube Music internal API
         url = "https://music.youtube.com/youtubei/v1/search"
         params = {"key": "AIzaSyC9XL3ZjWddXya6X74dJoCTL-NKNELL6tv"}
         payload = {
@@ -97,30 +75,29 @@ def search_youtube_music_id(query):
             app.logger.error(f"YTMusic API: {resp.status_code}")
             return None
 
-        # Parse response to find video IDs
-        import re
-        data = resp.text
-        video_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', data)
-        
+        video_ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', resp.text)
         seen = set()
         for vid in video_ids:
             if vid not in seen:
                 seen.add(vid)
-                app.logger.info(f"Found YTMusic video ID: {vid}")
+                app.logger.info(f"Found YTMusic ID: {vid}")
                 return vid
 
+        app.logger.error("No video IDs in YTMusic response")
         return None
     except Exception as e:
         app.logger.error(f"YTMusic search error: {e}")
         return None
 
-def get_youtube_stream(title, artist, album=""):
+def get_stream(title, artist):
     query = f"{title} {artist}".strip()
     app.logger.info(f"Searching YouTube Music for: {query}")
 
     video_id = search_youtube_music_id(query)
     if not video_id:
-        app.logger.error(f"No video ID found")
+        video_id = search_youtube_music_id(title)
+    if not video_id:
+        app.logger.error("No video ID found")
         return None
 
     app.logger.info(f"Got video ID: {video_id}")
@@ -147,9 +124,12 @@ def get_youtube_stream(title, artist, album=""):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             if not info:
+                app.logger.error("yt-dlp returned None")
                 return None
 
             formats = info.get("formats", [])
+            app.logger.info(f"Got {len(formats)} formats")
+
             audio_formats = [
                 f for f in formats
                 if f.get("acodec") != "none"
@@ -162,6 +142,7 @@ def get_youtube_stream(title, artist, album=""):
                     if f.get("acodec") != "none" and f.get("url")
                 ]
             if not audio_formats:
+                app.logger.error("No audio formats found")
                 return None
 
             best = max(audio_formats, key=lambda x: x.get("abr") or x.get("tbr") or 0)
@@ -176,6 +157,7 @@ def get_youtube_stream(title, artist, album=""):
     except Exception as e:
         app.logger.error(f"yt-dlp error: {type(e).__name__}: {str(e)}")
         return None
+
 @app.route("/search")
 def search():
     query = request.args.get("q", "").strip()
@@ -208,31 +190,30 @@ def stream():
             search_title = itunes_song["title"]
             search_artist = itunes_song["artist"]
         else:
-            # Use provided params directly
             itunes_song = None
             search_title = title or query
             search_artist = artist
 
-        app.logger.info(f"Searching SC for: {search_title} - {search_artist}")
+        app.logger.info(f"iTunes: {search_title} - {search_artist}")
 
-        # Step 2: Search SoundCloud with iTunes metadata
-        sc_data = search_soundcloud(search_title, search_artist)
-        if not sc_data:
+        # Step 2: Get YouTube Music stream
+        stream_data = get_stream(search_title, search_artist)
+        if not stream_data:
             return jsonify({
                 "success": False,
-                "error": f"No SoundCloud stream found for: {search_title} {search_artist}"
+                "error": f"No stream found for: {search_title} {search_artist}"
             }), 404
 
-        # Step 3: Combine iTunes metadata + SoundCloud audio
+        # Step 3: Combine iTunes metadata + YouTube Music audio
         result = {
             "id": itunes_song["id"] if itunes_song else search_title,
             "title": itunes_song["title"] if itunes_song else search_title,
             "artist": itunes_song["artist"] if itunes_song else search_artist,
             "album": itunes_song["album"] if itunes_song else "",
-            "artwork": itunes_song["artwork"] if itunes_song else sc_data.get("sc_artwork", ""),
-            "duration": itunes_song["duration"] if itunes_song else sc_data.get("duration", 0),
-            "url": sc_data["url"],
-            "ext": "mp3"
+            "artwork": itunes_song["artwork"] if itunes_song else "",
+            "duration": itunes_song["duration"] if itunes_song else 0,
+            "url": stream_data["url"],
+            "ext": stream_data["ext"]
         }
         return jsonify({"success": True, "data": result})
 
@@ -249,8 +230,8 @@ def audio():
         range_header = request.headers.get("Range", None)
         req_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://soundcloud.com/",
-            "Origin": "https://soundcloud.com"
+            "Referer": "https://music.youtube.com/",
+            "Origin": "https://music.youtube.com"
         }
         if range_header:
             req_headers["Range"] = range_header
@@ -285,14 +266,14 @@ def audio():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "musical-api-itunes-sc"})
+    return jsonify({"status": "ok", "service": "musical-api-ytmusic"})
 
 @app.route("/")
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "12.0.0",
-        "source": "iTunes (metadata) + SoundCloud (audio via Railway proxy)",
+        "version": "13.0.0",
+        "source": "iTunes (metadata) + YouTube Music (audio)",
         "endpoints": {
             "/search?q=query": "Search via iTunes",
             "/stream?title=X&artist=Y": "Get stream",
