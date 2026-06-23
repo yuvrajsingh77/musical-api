@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify, Response
 import requests
-import re
 
 app = Flask(__name__)
 
@@ -118,8 +117,15 @@ def search_soundcloud(title, artist):
                     continue
 
                 artwork = (track.get("artwork_url") or "").replace("large", "t500x500")
-                proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(raw_url, safe="")
-                app.logger.info(f"SC stream found: {track.get('title')}")
+
+                # HLS streams (.m3u8) — pass directly, ExoPlayer handles natively
+                # Regular MP3 — proxy through Railway to avoid Forbidden
+                if ".m3u8" in raw_url:
+                    proxy_url = raw_url
+                else:
+                    proxy_url = f"{RAILWAY_URL}/audio?url=" + requests.utils.quote(raw_url, safe="")
+
+                app.logger.info(f"SC stream found: {track.get('title')} | HLS: {'.m3u8' in raw_url}")
 
                 return {
                     "sc_id": str(track.get("id", "")),
@@ -249,13 +255,13 @@ def health():
 def index():
     return jsonify({
         "name": "Musical API",
-        "version": "16.0.0",
+        "version": "17.0.0",
         "source": "iTunes (metadata) + SoundCloud (audio)",
         "endpoints": {
             "/search?q=query": "Search via iTunes",
             "/stream?title=X&artist=Y": "Get stream",
             "/stream?q=query": "Get stream by query",
-            "/audio?url=encoded_url": "Proxy audio",
+            "/audio?url=encoded_url": "Proxy audio (MP3 only)",
             "/health": "Health check"
         }
     })
